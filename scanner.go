@@ -12,6 +12,10 @@
 //   Fichiers : package.json, package-lock.json, yarn.lock
 //   Condition : Le package ET sa version exacte sont dans la base (802 packages)
 //
+// DÉPENDANCES DÉCLARÉES COMPROMISES [HAUTE]
+//   Fichiers : package.json (champs dependencies, devDependencies)
+//   Condition : Le nom du package est dans la base (version non vérifiable car semver)
+//
 // SCRIPTS SUSPECTS [HAUTE]
 //   Fichiers : package.json (champs preinstall, postinstall, install)
 //   Condition : Le script contient "setup_bun" OU "bun_environment" OU "bun "
@@ -226,6 +230,34 @@ func (s *Scanner) checkPackageJSON(path string) {
 			Details:     "Package is in the known compromised list",
 			Severity:    "critical",
 		})
+	}
+
+	// Check declared dependencies
+	for depName, depVersion := range pkg.Dependencies {
+		if _, found := s.compromisedPackages[depName]; found {
+			s.addDetection(Detection{
+				Type:        "compromised_dependency_declared",
+				Path:        path,
+				PackageName: depName,
+				Version:     depVersion,
+				Details:     "Compromised package declared in dependencies (check package-lock.json for exact version)",
+				Severity:    "high",
+			})
+		}
+	}
+
+	// Check declared devDependencies
+	for depName, depVersion := range pkg.DevDependencies {
+		if _, found := s.compromisedPackages[depName]; found {
+			s.addDetection(Detection{
+				Type:        "compromised_dependency_declared",
+				Path:        path,
+				PackageName: depName,
+				Version:     depVersion,
+				Details:     "Compromised package declared in devDependencies (check package-lock.json for exact version)",
+				Severity:    "high",
+			})
+		}
 	}
 
 	suspiciousScripts := []string{"preinstall", "postinstall", "install"}
@@ -470,6 +502,10 @@ func (s *Scanner) Scan() {
 	s.logln("  PACKAGES COMPROMIS [CRITIQUE]")
 	s.logln("    Fichiers : package.json, package-lock.json, yarn.lock")
 	s.logln("    Condition : Le package ET sa version exacte sont dans la base (802 packages)")
+	s.logln()
+	s.logln("  DÉPENDANCES DÉCLARÉES COMPROMISES [HAUTE]")
+	s.logln("    Fichiers : package.json (champs dependencies, devDependencies)")
+	s.logln("    Condition : Le nom du package est dans la base (version non vérifiable car semver)")
 	s.logln()
 	s.logln("  SCRIPTS SUSPECTS [HAUTE]")
 	s.logln("    Fichiers : package.json (champs preinstall, postinstall, install)")
