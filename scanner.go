@@ -14,7 +14,7 @@
 //
 // DÉPENDANCES DÉCLARÉES COMPROMISES [HAUTE]
 //   Fichiers : package.json (champs dependencies, devDependencies)
-//   Condition : Le nom du package est dans la base (version non vérifiable car semver)
+//   Condition : Le range semver (^, ~, >=) pourrait résoudre vers une version compromise
 //
 // SCRIPTS SUSPECTS [HAUTE]
 //   Fichiers : package.json (champs preinstall, postinstall, install)
@@ -208,6 +208,109 @@ func (s *Scanner) isCompromised(pkgName, version string) bool {
 	return contains(versions, version)
 }
 
+// parseVersion extrait major, minor, patch d'une version semver
+// Retourne -1 pour les parties non parsables
+func parseVersion(version string) (major, minor, patch int) {
+	major, minor, patch = -1, -1, -1
+
+	// Nettoyer le préfixe semver (^, ~, >=, <=, >, <, =)
+	cleaned := strings.TrimLeft(version, "^~>=<= ")
+
+	// Extraire la partie version (avant tout suffixe comme -beta, -rc, etc.)
+	if idx := strings.IndexAny(cleaned, "-+"); idx != -1 {
+		cleaned = cleaned[:idx]
+	}
+
+	parts := strings.Split(cleaned, ".")
+	if len(parts) >= 1 {
+		fmt.Sscanf(parts[0], "%d", &major)
+	}
+	if len(parts) >= 2 {
+		fmt.Sscanf(parts[1], "%d", &minor)
+	}
+	if len(parts) >= 3 {
+		fmt.Sscanf(parts[2], "%d", &patch)
+	}
+	return
+}
+
+// couldMatchCompromised vérifie si une version semver déclarée pourrait résoudre
+// vers une des versions compromises
+func (s *Scanner) couldMatchCompromised(pkgName, declaredVersion string) (bool, string) {
+	compromisedVersions, found := s.compromisedPackages[pkgName]
+	if !found {
+		return false, ""
+	}
+
+	// Si pas de versions spécifiques, toutes sont compromises
+	if len(compromisedVersions) == 0 {
+		return true, "all versions"
+	}
+
+	declaredMajor, declaredMinor, declaredPatch := parseVersion(declaredVersion)
+
+	// Déterminer le type de range
+	isExact := !strings.ContainsAny(declaredVersion, "^~><*x")
+	isCaret := strings.HasPrefix(declaredVersion, "^") // ^1.2.3 = >=1.2.3 <2.0.0
+	isTilde := strings.HasPrefix(declaredVersion, "~") // ~1.2.3 = >=1.2.3 <1.3.0
+	isGte := strings.HasPrefix(declaredVersion, ">=")  // >=1.2.3
+	isGt := strings.HasPrefix(declaredVersion, ">") && !isGte
+	isWildcard := strings.Contains(declaredVersion, "*") || strings.Contains(declaredVersion, "x")
+
+	for _, compVer := range compromisedVersions {
+		compMajor, compMinor, compPatch := parseVersion(compVer)
+
+		if compMajor == -1 {
+			continue // Version compromise non parsable
+		}
+
+		// Wildcard ou latest = potentiellement dangereux
+		if isWildcard || declaredVersion == "latest" || declaredVersion == "*" {
+			return true, compVer
+		}
+
+		// Version exacte
+		if isExact && declaredMajor == compMajor && declaredMinor == compMinor && declaredPatch == compPatch {
+			return true, compVer
+		}
+
+		// Caret (^) : même major, version compromise >= déclarée
+		if isCaret && declaredMajor == compMajor {
+			if compMinor > declaredMinor || (compMinor == declaredMinor && compPatch >= declaredPatch) {
+				return true, compVer
+			}
+		}
+
+		// Tilde (~) : même major.minor, version compromise >= déclarée
+		if isTilde && declaredMajor == compMajor && declaredMinor == compMinor {
+			if compPatch >= declaredPatch {
+				return true, compVer
+			}
+		}
+
+		// >= ou >
+		if isGte || isGt {
+			// La version compromise doit être >= (ou >) à la version déclarée
+			if compMajor > declaredMajor {
+				return true, compVer
+			}
+			if compMajor == declaredMajor && compMinor > declaredMinor {
+				return true, compVer
+			}
+			if compMajor == declaredMajor && compMinor == declaredMinor {
+				if isGte && compPatch >= declaredPatch {
+					return true, compVer
+				}
+				if isGt && compPatch > declaredPatch {
+					return true, compVer
+				}
+			}
+		}
+	}
+
+	return false, ""
+}
+
 func (s *Scanner) checkPackageJSON(path string) {
 	data, err := os.ReadFile(path)
 	if err != nil {
@@ -234,13 +337,13 @@ func (s *Scanner) checkPackageJSON(path string) {
 
 	// Check declared dependencies
 	for depName, depVersion := range pkg.Dependencies {
-		if _, found := s.compromisedPackages[depName]; found {
+		if matches, matchedVer := s.couldMatchCompromised(depName, depVersion); matches {
 			s.addDetection(Detection{
 				Type:        "compromised_dependency_declared",
 				Path:        path,
 				PackageName: depName,
 				Version:     depVersion,
-				Details:     "Compromised package declared in dependencies (check package-lock.json for exact version)",
+				Details:     fmt.Sprintf("Version range could resolve to compromised version %s", matchedVer),
 				Severity:    "high",
 			})
 		}
@@ -248,13 +351,13 @@ func (s *Scanner) checkPackageJSON(path string) {
 
 	// Check declared devDependencies
 	for depName, depVersion := range pkg.DevDependencies {
-		if _, found := s.compromisedPackages[depName]; found {
+		if matches, matchedVer := s.couldMatchCompromised(depName, depVersion); matches {
 			s.addDetection(Detection{
 				Type:        "compromised_dependency_declared",
 				Path:        path,
 				PackageName: depName,
 				Version:     depVersion,
-				Details:     "Compromised package declared in devDependencies (check package-lock.json for exact version)",
+				Details:     fmt.Sprintf("Version range could resolve to compromised version %s", matchedVer),
 				Severity:    "high",
 			})
 		}
@@ -505,7 +608,7 @@ func (s *Scanner) Scan() {
 	s.logln()
 	s.logln("  DÉPENDANCES DÉCLARÉES COMPROMISES [HAUTE]")
 	s.logln("    Fichiers : package.json (champs dependencies, devDependencies)")
-	s.logln("    Condition : Le nom du package est dans la base (version non vérifiable car semver)")
+	s.logln("    Condition : Le range semver (^, ~, >=) pourrait résoudre vers une version compromise")
 	s.logln()
 	s.logln("  SCRIPTS SUSPECTS [HAUTE]")
 	s.logln("    Fichiers : package.json (champs preinstall, postinstall, install)")
